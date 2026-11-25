@@ -1,4 +1,8 @@
 import streamlit as st
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+import json
 from datetime import time, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import re, secrets, hashlib, hmac, smtplib, ssl, unicodedata, threading
@@ -55,193 +59,127 @@ def compatible(a,b,d):
             and hora_match(a['hora'],b['hora']))
 
 
-st.markdown('''<style>.stApp {background:#f4f8f7;} [data-testid="stHeader"] {background:#f4f8f7;} .hero {background:#08665e;color:white;padding:24px;border-radius:18px;margin-bottom:18px;} .hero h1 {color:white;margin:0;padding:0;} .hero p {margin:8px 0 0;} div[data-testid="stVerticalBlockBorderWrapper"] {background:white;border-radius:14px;} </style>''', unsafe_allow_html=True)
+
+def db(sql,args=(),one=False):
+    with psycopg.connect(st.secrets['database']['url'],row_factory=dict_row,connect_timeout=10) as c:
+        with c.cursor() as cur:
+            cur.execute(sql,args)
+            return (cur.fetchone() if one else cur.fetchall()) if cur.description else None
+
+def pack(t): return {**t,'fecha':t['fecha'].isoformat(),'hora':t['hora'].isoformat()}
+def unpack(t): return {**t,'fecha':date.fromisoformat(t['fecha']),'hora':time.fromisoformat(t['hora'])}
+def label(t): return f"{t['sentido']} · {zona_text(t['zona'])} · {t['hora']:%H:%M} · {t['rol']}"
+def refresh(): st.rerun()
+
+st.title('🚘 UCA Rides')
+st.caption('Tu misma ruta. Tu mismo horario. Tu comunidad. · Proyecto académico independiente, no oficial de la UCA.')
 s=st.session_state
-for k,v in {'page':'Registro','profile':{},'email':'','code_sent':False,'verified':False,'match':None,'messages':[],'agreed':False,'done':False,'rated':False,'reports':[],'trips':[],'otp_hash':'','otp_exp':0,'otp_attempts':0,'demo_mode':False}.items():
-    if k not in s: s[k]=v
-
-def go(page):
-    s.page=page
-    st.rerun()
-
-def mins(t): return t.hour*60+t.minute
-
-st.markdown('<div class="hero"><h1>🚘 UCA Rides</h1><p>Tu misma ruta. Tu mismo horario. Tu comunidad.</p></div>',unsafe_allow_html=True)
-st.caption('Prototipo académico independiente · Coincidencias ficticias · Sin pagos ni transporte real')
-with st.sidebar:
-    st.title('UCA Rides')
-    st.caption('Demostración del servicio')
-    if s.verified:
-        st.write(s.email)
-        if st.button('Mi perfil'): go('Perfil')
-        if s.profile and st.button('Mis desplazamientos'): go('Desplazamientos')
-        if s.profile and s.trips and st.button('Buscar coincidencias'): go('Coincidencias')
-    if st.button('Cerrar sesión y borrar datos'):
-        s.clear(); st.rerun()
-
-if s.page=='Registro':
-    st.subheader('1. Registro universitario')
+if 'verified' not in s: s.verified=False
+if not s.verified:
+    st.subheader('Acceso institucional')
+    email=st.text_input('Correo @uca.edu.sv').strip().lower()
     cfg=smtp_config()
-    st.write('Accede con un correo institucional @uca.edu.sv.')
-    st.caption('La verificación confirma acceso al buzón, no matrícula activa. Los datos del perfil y los viajes permanecen en la sesión. No introduzcas datos sensibles.')
-    email=st.text_input('Correo institucional',value=s.email,placeholder='estudiante@uca.edu.sv').strip().lower()
-    if not cfg: st.warning('El envío real aún no está configurado. Puedes usar únicamente la demostración identificada abajo.')
-    if st.button('Enviar código al correo',type='primary',disabled=not bool(cfg)):
-        if not valid_email(email): st.error('Introduce un correo válido @uca.edu.sv.')
-        elif not reserve_send(email): st.warning('Límite de envíos alcanzado. Espera antes de volver a solicitar un código.')
+    if not cfg: st.warning('El administrador debe configurar el correo remitente. No se permite acceso sin verificación.'); st.stop()
+    if st.button('Enviar código',type='primary'):
+        if not valid_email(email): st.error('Solo se aceptan correos @uca.edu.sv.')
+        elif not reserve_send(email): st.warning('Límite de envíos. Intenta más tarde.')
         else:
-            code=f'{secrets.randbelow(1000000):06d}'
-            s.code_sent=False; s.otp_hash=''; s.otp_attempts=0
+            s.pop('otp',None); code=f'{secrets.randbelow(1000000):06d}'
             try:
-                send_code(email,code,cfg)
-                s.email=email; s.otp_hash=hashlib.sha256(code.encode()).hexdigest(); s.otp_exp=monotonic()+600; s.code_sent=True
-                st.success('Código enviado. Revisa tu buzón y correo no deseado.')
-            except Exception: st.error('No se pudo enviar el correo. Revisa la configuración SMTP con el administrador.')
-    if s.code_sent and cfg:
-        code=st.text_input('Código de seis dígitos',max_chars=6,type='password')
-        consent=st.checkbox('Acepto las reglas de convivencia y el tratamiento temporal de datos para este prototipo.')
-        if st.button('Verificar y continuar',type='primary'):
-            if email!=s.email: st.error('Solicita un código para el correo actualizado.')
-            elif monotonic()>s.otp_exp or s.otp_attempts>=5: s.code_sent=False; s.otp_hash=''; st.error('Código vencido o límite de intentos alcanzado. Solicita otro.')
-            elif not consent: st.error('Acepta las reglas para continuar.')
+                send_code(email,code,cfg); s.otp=(email,hashlib.sha256(code.encode()).hexdigest(),monotonic()+600); s.attempts=0; st.success('Código enviado. Revisa Outlook y correo no deseado.')
+            except Exception: st.error('No se pudo enviar. El administrador debe revisar SMTP.')
+    if 'otp' in s:
+        code=st.text_input('Código de seis dígitos',type='password',max_chars=6)
+        st.info('Privacidad: se guardan correo, nombre, carrera, zona aproximada, horarios, mensajes y valoraciones para conectar estudiantes. No publiques domicilio exacto, teléfonos ni datos sensibles. Los participantes pueden ver tu perfil y tus viajes compatibles. Los administradores pueden revisar reportes y datos para operar el piloto. Solicita eliminación al equipo responsable antes de participar si necesitas más información.')
+        ok=st.checkbox('Acepto participar en el piloto, el tratamiento descrito y las reglas: respeto, encuentro público, ningún cobro de la plataforma y reporte de incidentes.')
+        if st.button('Verificar y entrar'):
+            e,h,expiry=s.otp
+            if email!=e or monotonic()>expiry or s.attempts>=5: s.pop('otp',None); st.error('Solicita otro código.')
+            elif not ok: st.error('Debes aceptar las condiciones.')
             else:
-                s.otp_attempts+=1
-                if hmac.compare_digest(hashlib.sha256(code.encode()).hexdigest(),s.otp_hash):
-                    s.verified=True; s.demo_mode=False; s.code_sent=False; s.otp_hash=''; go('Perfil')
+                s.attempts+=1
+                if hmac.compare_digest(hashlib.sha256(code.encode()).hexdigest(),h): s.email=e; s.verified=True; s.pop('otp',None); refresh()
                 else: st.error('Código incorrecto.')
-    st.divider()
-    if st.button('Entrar a demostración ficticia (sin verificación)'):
-        s.email='demo@uca.edu.sv'; s.verified=True; s.demo_mode=True; s.code_sent=False; s.otp_hash=''; go('Perfil')
-
-elif s.page=='Perfil':
-    st.subheader('2. Mi perfil')
-    p=s.profile
+    st.stop()
+me=s.email
+with st.sidebar:
+    st.caption(me)
+    if st.button('Cerrar sesión'): s.clear(); refresh()
+try: profile=db('select data from ur_profiles where email=%s',(me,),True)
+except Exception: st.error('Base de datos no disponible. Revisa Secrets y ejecuta schema.sql.'); st.stop()
+p=profile['data'] if profile else {}
+page=st.sidebar.radio('Menú',['Mi perfil','Mis viajes','Coincidencias','Solicitudes y chat','Historial y reportes']) if p else 'Mi perfil'
+if page=='Mi perfil':
+    st.subheader('Mi perfil')
     with st.form('perfil'):
-        name=st.text_input('Nombre o alias',p.get('name',''))
-        carrera=st.text_input('Carrera',p.get('carrera',''))
-        st.markdown('**Zona de residencia**')
-        zona=zona_form('res',p.get('zona'))
-        opciones=['Prefiero no indicar','Mujer','Hombre','Otro']
-        genero=st.selectbox('Género (opcional)',opciones,index=opciones.index(p.get('genero',opciones[0])))
-        st.caption('No escribas direcciones exactas. Puedes registrar viajes desde tu trabajo u otra zona más adelante.')
-        if st.form_submit_button('Guardar perfil',type='primary'):
-            if not name.strip() or not carrera.strip() or not zona['mun']: st.error('Completa nombre, carrera y municipio o distrito.')
-            else: s.profile=dict(name=name,carrera=carrera,zona=zona,genero=genero); go('Desplazamientos')
-
-elif s.page=='Desplazamientos':
-    st.subheader('3. Mis desplazamientos')
-    st.write('Registra tantos viajes como necesites por día. Cada viaje puede tener una ubicación, horario y rol distintos.')
-    for i,t in enumerate(s.trips):
-        with st.container(border=True):
-            st.write(f"**{t['sentido']}** · {zona_text(t['zona'])} · {t['hora']:%H:%M} · {t['rol']}")
-            st.caption(f"{t['frecuencia']} · "+(str(t['fecha']) if t['frecuencia']=='Una sola vez' else ', '.join(DIAS[j] for j in t['dias'])+f" desde {t['fecha']}"))
-            if st.button('Eliminar viaje',key=f'del{i}'): s.trips.pop(i); st.rerun()
-    with st.container(border=True):
-        st.markdown('**Agregar desplazamiento**')
-        sentido=st.radio('Sentido',['Hacia la UCA','Desde la UCA'],horizontal=True)
-        origen=st.radio('Ubicación fuera del campus',['Mi residencia','Trabajo u otro sector'],horizontal=True)
-        zona=s.profile['zona'] if origen=='Mi residencia' else zona_form('viaje')
-        frecuencia=st.radio('Frecuencia',['Una sola vez','Semanal recurrente'],horizontal=True)
-        fecha=st.date_input('Fecha del viaje' if frecuencia=='Una sola vez' else 'Fecha de inicio',value=hoy(),min_value=hoy(),key='fecha_viaje')
-        dias=st.multiselect('Días de la semana',DIAS) if frecuencia=='Semanal recurrente' else []
-        hora=st.time_input('Hora prevista de llegada a la UCA' if sentido=='Hacia la UCA' else 'Hora prevista de salida de la UCA',value=None,step=timedelta(minutes=1))
-        rol=st.radio('Rol en este viaje',['Pasajero','Conductor'],horizontal=True)
-        asientos=st.number_input('Asientos disponibles',min_value=1,max_value=8,value=1) if rol=='Conductor' else 0
-        if st.button('Agregar viaje',type='primary'):
-            if not zona['mun'] or hora is None or (frecuencia=='Semanal recurrente' and not dias): st.error('Completa ubicación, hora y días si es recurrente.')
-            else:
-                s.trips.append(dict(sentido=sentido,zona=zona,frecuencia=frecuencia,fecha=fecha,dias=[DIAS.index(d) for d in dias],hora=hora,rol=rol,asientos=asientos)); st.rerun()
-    if s.trips and st.button('Buscar coincidencias',type='primary'): go('Coincidencias')
-
-elif s.page=='Coincidencias':
-    st.subheader('4. Encuentra tu ride')
-    if not s.trips: st.info('Agrega un viaje primero.'); st.stop()
-    idx=st.selectbox('Desplazamiento',range(len(s.trips)),format_func=lambda i:f"{i+1}. {s.trips[i]['sentido']} · {zona_text(s.trips[i]['zona'])} · {s.trips[i]['hora']:%H:%M}")
-    t=s.trips[idx]
-    fecha=st.date_input('Fecha a buscar',value=max(hoy(),t['fecha']),min_value=hoy(),key=f'buscar{idx}')
-    filtro=st.selectbox('Filtrar por género',['Todos','Mujer','Hombre','Otro'])
-    st.caption('Se compara fecha, sentido, municipio/distrito y departamento, roles complementarios y hora en la UCA ±15 minutos. La colonia y ruta se confirman en el chat; no se calcula una ruta GPS.')
-    if not aplica(t,fecha): st.warning('Este desplazamiento no está programado para esa fecha.'); st.stop()
-    if not st.checkbox('Mostrar coincidencias ficticias de prueba para este viaje'):
-        st.info('No hay un directorio real de estudiantes conectado. Activa la simulación para probar el flujo.')
-    else:
-        st.warning('Perfiles ficticios generados para probar el algoritmo; no son ofertas reales.')
-        base=t['hora'].hour*60+t['hora'].minute
-        role='Conductor' if t['rol']=='Pasajero' else 'Pasajero'
+        name=st.text_input('Nombre',p.get('name',''),max_chars=80); carrera=st.text_input('Carrera',p.get('carrera',''),max_chars=100)
+        zona=zona_form('res',p.get('zona')); options=['Prefiero no indicar','Mujer','Hombre','Otro']; gender=st.selectbox('Género (opcional)',options,index=options.index(p.get('genero',options[0])))
+        avatar=st.selectbox('Avatar',['🚗','🎓','🌿','⭐'],index=['🚗','🎓','🌿','⭐'].index(p.get('avatar','🎓')))
+        if st.form_submit_button('Guardar perfil'):
+            if not name.strip() or not carrera.strip() or not zona['mun']: st.error('Completa los campos.')
+            else: db('insert into ur_profiles values (%s,%s) on conflict(email) do update set data=excluded.data',(me,Jsonb(dict(name=name,carrera=carrera,zona=zona,genero=gender,avatar=avatar)))); refresh()
+    st.caption('La verificación acredita acceso al correo, no matrícula activa. No escribas direcciones exactas.')
+else:
+    own=db('select id,data from ur_trips where owner=%s and active order by id desc',(me,))
+    if page=='Mis viajes':
+        st.subheader('Mis desplazamientos')
+        for row in own:
+            t=unpack(row['data']); st.write(label(t)); st.caption(f"Desde {t['fecha']} · {t['frecuencia']} · "+', '.join(DIAS[x] for x in t['dias']))
+            if st.button('Desactivar',key=f"del{row['id']}"):
+                db('update ur_trips set active=false where id=%s and owner=%s',(row['id'],me)); db("update ur_requests set status='Cancelado' where (driver_trip=%s or passenger_trip=%s) and status in ('Pendiente','Aceptado')",(row['id'],row['id'])); refresh()
+        st.divider(); st.subheader('Nuevo viaje')
+        sentido=st.radio('Sentido',['Hacia la UCA','Desde la UCA']); zona=p['zona'] if st.radio('Ubicación',['Mi residencia','Trabajo u otra zona'])=='Mi residencia' else zona_form('trip')
+        frecuencia=st.radio('Frecuencia',['Una sola vez','Semanal recurrente']); fecha=st.date_input('Fecha de inicio',min_value=hoy()); dias=st.multiselect('Días',DIAS) if frecuencia=='Semanal recurrente' else []
+        hora=st.time_input('Llegada a la UCA' if sentido=='Hacia la UCA' else 'Salida de la UCA',value=None,step=60); rol=st.radio('Rol',['Pasajero','Conductor']); seats=st.number_input('Asientos libres',1,8,1) if rol=='Conductor' else 0
+        if st.button('Publicar viaje',type='primary'):
+            if not zona['mun'] or hora is None or (frecuencia=='Semanal recurrente' and not dias): st.error('Completa ubicación, hora y días.')
+            else: db('insert into ur_trips(owner,data) values (%s,%s)',(me,Jsonb(pack(dict(sentido=sentido,zona=zona,frecuencia=frecuencia,fecha=fecha,dias=[DIAS.index(d) for d in dias],hora=hora,rol=rol,asientos=seats))))); refresh()
+    elif page=='Coincidencias':
+        st.subheader('Coincidencias reales')
+        if not own: st.info('Publica un viaje primero.'); st.stop()
+        a=st.selectbox('Tu viaje',own,format_func=lambda r:label(unpack(r['data']))); t=unpack(a['data']); day=st.date_input('Fecha a buscar',min_value=hoy(),value=max(hoy(),t['fecha'])); g=st.selectbox('Género',['Todos','Mujer','Hombre','Otro'])
+        st.caption('Mismo departamento y municipio/distrito escrito, sentido y fecha, roles complementarios, ±15 min. Confirma ruta exacta y asiento en chat; no hay GPS.')
         found=0
-        for name,carrera,delta,g,seat in [('Luis R.','Ingeniería Industrial',-5,'Hombre',2),('Sofía M.','Psicología',10,'Mujer',1),('Alex T.','Economía',30,'Otro',1)]:
-            n=base+delta
-            if not 0<=n<1440: continue
-            h=time(n//60,n%60)
-            candidate=dict(t,frecuencia='Una sola vez',fecha=fecha,hora=h,rol=role,asientos=seat if role=='Conductor' else 0)
-            if not compatible(t,candidate,fecha) or (filtro!='Todos' and filtro!=g): continue
-            found+=1
+        for b in db('select t.id,t.owner,t.data,p.data as profile from ur_trips t join ur_profiles p on p.email=t.owner where t.active and t.owner<>%s',(me,)):
+            u=unpack(b['data']); q=b['profile']
+            if not compatible(t,u,day) or (g!='Todos' and q['genero']!=g): continue
+            found+=1; d,pa=(a,b) if t['rol']=='Conductor' else (b,a); driver,passenger=(me,b['owner']) if t['rol']=='Conductor' else (b['owner'],me)
             with st.container(border=True):
-                st.write(f'**{name} (ficticio)** · {role} · {carrera}')
-                st.caption(f"{zona_text(t['zona'])} · {fecha} · {h:%H:%M} · diferencia {abs(delta)} min")
-                if role=='Conductor': st.write(f'{seat} asiento(s) disponible(s)')
-                if st.button('Contactar',key='contact'+name,type='primary'):
-                    s.match=dict(name=name,rol=role,hora=h,zona=zona_text(t['zona']),sentido=t['sentido'],fecha=fecha); s.messages=[]; s.agreed=False; s.done=False; s.rated=False; go('Chat')
-        if not found: st.info('No hay coincidencias ficticias con estos filtros.')
-    if st.button('Volver a mis desplazamientos'): go('Desplazamientos')
-
-elif s.page=='Chat':
-    m=s.match
-    st.subheader('5. Chat interno')
-    st.write(f"Conversación con **{m['name']}** · {m['zona']}")
-    st.caption('Mensajes simulados; no se comparten números telefónicos.')
-    with st.chat_message('assistant'): st.write('¡Hola! Vamos por la misma ruta. ¿Nos conocemos primero en el campus?')
-    for msg in s.messages:
-        with st.chat_message('user'): st.write(msg)
-        with st.chat_message('assistant'): st.write('¡Perfecto! Podemos acordar un punto público en el campus. (Respuesta simulada)')
-    msg=st.chat_input('Escribe un mensaje')
-    if msg: s.messages.append(msg); st.rerun()
-    if st.button('Acordar encuentro',type='primary'): go('Acuerdo')
-    if st.button('Reportar conducta inadecuada'): go('Reporte')
-    if st.button('Volver a coincidencias'): go('Coincidencias')
-
-elif s.page=='Acuerdo':
-    st.subheader('6. Acuerdo de viaje')
-    m=s.match
-    st.write(f"{m['name']} · {m['sentido']} · {m['zona']} · {m['fecha']}")
-    st.caption('Conózcanse previamente en el campus. Para viajes hacia la UCA, acuerden un punto público de salida fuera del campus.')
-    punto=st.text_input('Punto público de encuentro (sin dirección privada)')
-    hora=st.time_input('Hora acordada',m['hora'])
-    ok=st.checkbox('Entiendo que el encuentro, el viaje y cualquier reparto voluntario de gastos se acuerdan entre particulares.')
-    if st.button('Confirmar acuerdo simulado',type='primary'):
-        if not ok or not punto.strip(): st.error('Indica el punto público y acepta la condición para continuar.')
-        else: s.agreed=True; s.punto=punto; s.hora=hora; go('Viaje')
-
-elif s.page=='Viaje':
-    st.subheader('Viaje acordado')
-    st.success('Acuerdo confirmado en la simulación.')
-    st.write(f"📍 {s.punto} · {s.hora:%H:%M}")
-    st.write(f"Con {s.match['name']} · {s.match['zona']}")
-    st.info('La plataforma no presta transporte, no fija precios y no procesa pagos.')
-    if st.button('Simular viaje completado',type='primary'): s.done=True; go('Calificación')
-    if st.button('Cancelar acuerdo'): s.agreed=False; go('Coincidencias')
-
-elif s.page=='Calificación':
-    st.subheader('7. Evalúa tu experiencia')
-    stars=st.radio('Calificación',['★','★★','★★★','★★★★','★★★★★'],index=4,horizontal=True)
-    comment=st.text_area('Comentario opcional')
-    if st.button('Enviar calificación',type='primary'):
-        s.rated=True; s.rating=len(stars); go('Final')
-
-elif s.page=='Final':
-    st.success('¡Gracias por compartir tu experiencia!')
-    st.write(f"Calificación simulada: {s.rating}/5")
-    st.write('Has completado el recorrido principal del prototipo.')
-    if st.button('Buscar otro viaje',type='primary'): go('Coincidencias')
-
-elif s.page=='Reporte':
-    st.subheader('Reporte de seguridad')
-    reason=st.selectbox('Motivo',['Conducta inadecuada','Perfil sospechoso','Otro'])
-    detail=st.text_area('Descripción (solo datos ficticios)')
-    if st.button('Enviar reporte simulado',type='primary'):
-        s.reports.append((reason,detail)); st.success('Reporte guardado temporalmente en esta sesión. No se ha enviado a ninguna institución.')
-    if st.button('Volver al chat'): go('Chat')
-
-if s.verified and s.demo_mode: st.info('Sesión de demostración: correo no verificado.')
-st.divider()
-st.caption('Proyecto de Innovación y Desarrollo de Productos y Servicios · Prototipo no oficial de UCA Rides')
+                st.write(f"{q['avatar']} {q['name']} · {q['carrera']}"); st.write(label(u)); rating=db('select avg(stars) as avg,count(*) as n from ur_ratings where target=%s',(b['owner'],),True); st.caption(f"Valoraciones: {float(rating['avg']):.1f}/5 ({rating['n']})" if rating['n'] else 'Sin valoraciones aún')
+                if st.button('Enviar solicitud',key=f"req{b['id']}"):
+                    db('insert into ur_requests(driver_trip,passenger_trip,day,sender,driver,passenger) values (%s,%s,%s,%s,%s,%s) on conflict do nothing',(d['id'],pa['id'],day,me,driver,passenger)); st.success('Solicitud registrada. Revisa Solicitudes y chat.')
+        if not found: st.info('No hay coincidencias por ahora. Vuelve a consultar cuando se publiquen nuevos viajes.')
+    else:
+        rows=db('select r.*,p.data as other from ur_requests r join ur_profiles p on p.email=case when r.driver=%s then r.passenger else r.driver end where r.driver=%s or r.passenger=%s order by r.id desc',(me,me,me))
+        rows=[r for r in rows if (r['status'] in ('Pendiente','Aceptado'))==(page=='Solicitudes y chat')]
+        if not rows: st.info('No hay solicitudes en esta sección.'); st.stop()
+        r=st.selectbox('Viaje',rows,format_func=lambda r:f"{r['other']['name']} · {r['day']} · {r['status']} · #{r['id']}"); rid=r['id']; status=r['status']; other=r['passenger'] if r['driver']==me else r['driver']
+        if status=='Pendiente' and r['sender']!=me:
+            if st.button('Aceptar solicitud'):
+                # Serialize approvals for a driver's trip and date using a transaction lock.
+                with psycopg.connect(st.secrets['database']['url']) as c:
+                    with c.cursor() as cur:
+                        cur.execute('select id from ur_trips where id=%s for update',(r['driver_trip'],)); cur.execute('select data,active from ur_trips where id=%s',(r['driver_trip'],)); dt,active=cur.fetchone(); cur.execute('select active from ur_trips where id=%s',(r['passenger_trip'],)); pa_active=cur.fetchone()[0]; cur.execute("select count(*) from ur_requests where driver_trip=%s and day=%s and status in ('Aceptado','Completado')",(r['driver_trip'],r['day'])); n=cur.fetchone()[0]
+                        if active and pa_active and n<int(dt['asientos']): cur.execute("update ur_requests set status='Aceptado' where id=%s and status='Pendiente'",(rid,))
+                        else: st.error('No quedan asientos o el viaje fue desactivado.'); st.stop()
+                refresh()
+        if status in ('Pendiente','Aceptado'):
+            if st.button('Cancelar / rechazar'): db("update ur_requests set status='Cancelado' where id=%s and (driver=%s or passenger=%s) and status in ('Pendiente','Aceptado')",(rid,me,me)); refresh()
+            st.subheader('Chat privado'); st.button('Actualizar mensajes')
+            for m in db('select sender,body from ur_messages where request_id=%s order by id',(rid,)):
+                with st.chat_message('user' if m['sender']==me else 'assistant'): st.text(m['body'])
+            with st.form(f'msg{rid}',clear_on_submit=True):
+                msg=st.text_area('Mensaje',max_chars=1000)
+                if st.form_submit_button('Enviar') and msg.strip(): db('insert into ur_messages(request_id,sender,body) values (%s,%s,%s)',(rid,me,msg.strip())); refresh()
+            if status=='Aceptado':
+                with st.form('meeting'):
+                    meeting=st.text_input('Punto público y hora acordados',r['meeting'] or '',max_chars=200)
+                    if st.form_submit_button('Guardar acuerdo') and meeting.strip(): db('update ur_requests set meeting=%s where id=%s',(meeting,rid)); refresh()
+                if r['meeting'] and st.button('Marcar viaje realizado'): db("update ur_requests set status='Completado' where id=%s and status='Aceptado'",(rid,)); refresh()
+        if status=='Completado':
+            stars=st.slider('Calificar a tu compañero',1,5,5)
+            if st.button('Guardar valoración'): db('insert into ur_ratings values (%s,%s,%s,%s) on conflict(request_id,author) do update set stars=excluded.stars',(rid,me,other,stars)); st.success('Valoración guardada.')
+        with st.form(f'report{rid}'):
+            reason=st.text_area('Reportar conducta inadecuada',max_chars=1000)
+            if st.form_submit_button('Enviar reporte') and reason.strip(): db('insert into ur_reports(author,request_id,body) values (%s,%s,%s)',(me,rid,reason)); st.success('Reporte registrado para revisión del equipo.')
+        st.caption('No se procesan pagos. Acuerda el viaje voluntariamente y reúnete en un lugar público. En una emergencia contacta a las autoridades.')
