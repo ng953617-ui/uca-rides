@@ -41,7 +41,7 @@ def send_code(email, code, cfg):
     msg=EmailMessage(); msg['Subject']='UCA Rides | Código de verificación'; msg['From']=cfg['user']; msg['To']=email
     msg.set_content(f'Tu código de UCA Rides es {code}. Vence en 10 minutos. Si no solicitaste este código, ignora este mensaje. Prototipo académico independiente, no oficial de la UCA.')
     with smtplib.SMTP_SSL(cfg.get('host','smtp.gmail.com'),int(cfg.get('port',465)),context=ssl.create_default_context(),timeout=15) as server:
-        server.login(cfg['user'],cfg['password']); server.send_message(msg)
+        server.login(cfg['user'],''.join(cfg['password'].split())); server.send_message(msg)
 
 def zona_form(prefix, defaults=None):
     defaults=defaults or {}; dep=st.selectbox('Departamento',DEPARTAMENTOS,index=DEPARTAMENTOS.index(defaults.get('dep','La Libertad')),key=prefix+'dep')
@@ -61,7 +61,13 @@ def compatible(a,b,d):
 
 
 def db(sql,args=(),one=False):
-    with psycopg.connect(st.secrets['database']['url'],row_factory=dict_row,connect_timeout=10) as c:
+    cfg=st.secrets['database']
+    if cfg.get('host'):
+        params={k:cfg[k] for k in ('host','port','dbname','user','password')}
+        conn=psycopg.connect(**params,sslmode='require',row_factory=dict_row,connect_timeout=10)
+    else:
+        conn=psycopg.connect(cfg['url'],row_factory=dict_row,connect_timeout=10)
+    with conn as c:
         with c.cursor() as cur:
             cur.execute(sql,args)
             return (cur.fetchone() if one else cur.fetchall()) if cur.description else None
@@ -106,7 +112,28 @@ with st.sidebar:
     st.caption(me)
     if st.button('Cerrar sesión'): s.clear(); refresh()
 try: profile=db('select data from ur_profiles where email=%s',(me,),True)
-except Exception: st.error('Base de datos no disponible. Revisa Secrets y ejecuta schema.sql.'); st.stop()
+except Exception as exc:
+    state=getattr(exc,'sqlstate',None)
+    msg=str(exc).lower()
+    if state=='28P01' or 'password authentication failed' in msg:
+        reason='DB-01: autenticación rechazada; revisa la contraseña vigente y el usuario del pooler.'
+    elif 'tenant or user not found' in msg or 'tenant not found' in msg:
+        reason='DB-02: usuario o proyecto del pooler no reconocido.'
+    elif state=='42P01':
+        reason='DB-03: no se encuentra la tabla ur_profiles en la base conectada.'
+    elif state=='42501':
+        reason='DB-04: permisos insuficientes para consultar la tabla.'
+    elif isinstance(exc,(KeyError,FileNotFoundError)):
+        reason='DB-05: faltan campos de Secrets.'
+    elif 'timeout' in msg or 'timed out' in msg or 'could not translate host' in msg or 'network is unreachable' in msg or 'connection refused' in msg:
+        reason='DB-06: problema de red, DNS o tiempo de conexión.'
+    elif 'invalid dsn' in msg or 'invalid uri' in msg or 'invalid connection' in msg:
+        reason='DB-07: formato de conexión incorrecto.'
+    else:
+        reason='DB-08: otro error de conexión o consulta.'
+    st.error(reason)
+    st.caption('Diagnóstico seguro: '+type(exc).__name__+(' · SQLSTATE '+state if state else ''))
+    st.stop()
 p=profile['data'] if profile else {}
 page=st.sidebar.radio('Menú',['Mi perfil','Mis viajes','Coincidencias','Solicitudes y chat','Historial y reportes']) if p else 'Mi perfil'
 if page=='Mi perfil':
