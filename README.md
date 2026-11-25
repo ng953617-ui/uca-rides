@@ -1,16 +1,22 @@
-# UCA Rides — prototipo académico
-Demostración interactiva de conexión de estudiantes por zona, horario (±15 min) y roles complementarios. No es un servicio oficial de la universidad.
+# UCA Rides v2 — prototipo académico independiente
 
-## Ejecutar localmente
-`pip install -r requirements.txt`
+Cobertura nacional mediante 14 departamentos y texto libre de municipio/distrito y sector. Viajes independientes hacia o desde la UCA, por fecha o recurrentes por días de la semana. Cada uno tiene hora prevista en la UCA, rol y asientos. No hay pagos ni transporte real.
 
-`streamlit run app.py`
+## Publicación
+Reemplazar app.py y README.md en el repositorio existente. Conservar requirements.txt y .streamlit/config.toml. Streamlit Community Cloud: rama main (o la rama real del repositorio), archivo app.py.
 
-## Publicar
-Subir app.py, requirements.txt, README.md y .streamlit/config.toml a un repositorio GitHub. En https://share.streamlit.io/ crear una aplicación seleccionando el repositorio, rama main y app.py.
+## Correo real (opcional)
+Crear una cuenta Gmail dedicada al prototipo y habilitar verificación en dos pasos y contraseña de aplicación. En Streamlit, Settings > Secrets (o Advanced settings al publicar), guardar:
 
-## Demostración
-Entrar con perfil ficticio o correo de ejemplo demo@uca.edu.sv y código 123456 (no se envía correo). Mantener Santa Tecla, pasajero y salida 17:05. Contactar a Luis o Sofía, enviar un mensaje, acordar encuentro, simular viaje y calificar. Reiniciar desde la barra lateral.
+```toml
+[smtp]
+host = "smtp.gmail.com"
+port = 465
+user = "TU_CORREO@gmail.com"
+password = "TU_CONTRASEÑA_DE_APLICACION"
+```
 
-## Alcance
-Los perfiles, mensajes y viajes son ficticios. El filtro de coincidencias se ejecuta realmente sobre datos de ejemplo. No hay autenticación real, base de datos persistente, chat entre personas, geolocalización ni pagos. Los datos permanecen temporalmente en la sesión. No introducir datos personales reales. La verificación del correo no demuestra matrícula activa.
+No subir claves a GitHub. La cuenta remitente puede ser Gmail, pero solo se aceptan destinatarios @uca.edu.sv. El código aleatorio vence en 10 minutos, tiene cinco intentos, y se limitan los envíos por destinatario y por proceso. Sin configuración, el acceso real se deshabilita; la demostración ficticia permanece disponible. El acceso al buzón no confirma matrícula activa. No se ha probado el envío SMTP desde Community Cloud.
+
+## Pruebas
+Registrar varias salidas/llegadas distintas en un día, incluida una ubicación diferente de la residencia. Elegir fecha de búsqueda compatible con el viaje y activar las coincidencias ficticias. Se comprueban fecha, sentido, municipio/distrito, departamento, roles y tolerancia de 15 minutos. No se geocodifica ni se calculan rutas GPS. Las coincidencias se generan para probar la interfaz; no son usuarios reales. Chat, acuerdos y calificaciones siguen siendo simulados. No hay base de datos compartida: cada sesión conserva temporalmente sus datos. No usar el prototipo para coordinar viajes reales.
